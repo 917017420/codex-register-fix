@@ -20,12 +20,27 @@ from ...core.upload.cpa_upload import generate_token_json, batch_upload_to_cpa, 
 from ...core.upload.team_manager_upload import upload_to_team_manager, batch_upload_to_team_manager
 from ...core.upload.sub2api_upload import batch_upload_to_sub2api, upload_to_sub2api
 
+from ...core.dynamic_proxy import get_proxy_url_for_task
 from ...database import crud
 from ...database.models import Account
 from ...database.session import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _get_proxy(request_proxy: Optional[str] = None) -> Optional[str]:
+    """获取代理 URL，策略与注册流程一致：代理列表 → 动态代理 → 静态配置"""
+    if request_proxy:
+        return request_proxy
+    with get_db() as db:
+        proxy = crud.get_random_proxy(db)
+        if proxy:
+            return proxy.proxy_url
+    proxy_url = get_proxy_url_for_task()
+    if proxy_url:
+        return proxy_url
+    return get_settings().proxy_url
 
 
 # ============== Pydantic Models ==============
@@ -585,8 +600,7 @@ class BatchValidateRequest(BaseModel):
 @router.post("/batch-refresh")
 async def batch_refresh_tokens(request: BatchRefreshRequest, background_tasks: BackgroundTasks):
     """批量刷新账号 Token"""
-    # 使用传入的代理或全局代理配置
-    proxy = request.proxy if request.proxy else get_settings().proxy_url
+    proxy = _get_proxy(request.proxy)
 
     results = {
         "success_count": 0,
@@ -618,9 +632,7 @@ async def batch_refresh_tokens(request: BatchRefreshRequest, background_tasks: B
 @router.post("/{account_id}/refresh")
 async def refresh_account_token(account_id: int, request: Optional[TokenRefreshRequest] = Body(default=None)):
     """刷新单个账号的 Token"""
-
-    # 使用传入的代理或全局代理配置
-    proxy = request.proxy if request and request.proxy else get_settings().proxy_url
+    proxy = _get_proxy(request.proxy if request else None)
     result = do_refresh(account_id, proxy)
 
     if result.success:
@@ -639,9 +651,7 @@ async def refresh_account_token(account_id: int, request: Optional[TokenRefreshR
 @router.post("/batch-validate")
 async def batch_validate_tokens(request: BatchValidateRequest):
     """批量验证账号 Token 有效性"""
-
-    # 使用传入的代理或全局代理配置
-    proxy = request.proxy if request.proxy else get_settings().proxy_url
+    proxy = _get_proxy(request.proxy)
 
     results = {
         "valid_count": 0,
@@ -681,9 +691,7 @@ async def batch_validate_tokens(request: BatchValidateRequest):
 @router.post("/{account_id}/validate")
 async def validate_account_token(account_id: int, request: Optional[TokenValidateRequest] = Body(default=None)):
     """验证单个账号的 Token 有效性"""
-
-    # 使用传入的代理或全局代理配置
-    proxy = request.proxy if request and request.proxy else get_settings().proxy_url
+    proxy = _get_proxy(request.proxy if request else None)
     is_valid, error = do_validate(account_id, proxy)
 
     return {
