@@ -302,6 +302,7 @@ class RegistrationEngine:
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
         self._otp_continue_url: Optional[str] = None  # OTP 验证后的 continue_url
+        self._device_id: Optional[str] = None  # Device ID，所有 API 请求共用
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -400,6 +401,7 @@ class RegistrationEngine:
 
                 if did:
                     self._log(f"Device ID: {did}")
+                    self._device_id = did
                     return did
 
                 self._log(
@@ -450,6 +452,8 @@ class RegistrationEngine:
                 "origin": "https://auth.openai.com",
                 "accept": "application/json",
                 "content-type": "application/json",
+                "user-agent": self._OAUTH_UA,
+                "oai-device-id": did,
             }
             headers.update(_make_trace_headers())
 
@@ -521,7 +525,10 @@ class RegistrationEngine:
                 "origin": "https://auth.openai.com",
                 "accept": "application/json",
                 "content-type": "application/json",
+                "user-agent": self._OAUTH_UA,
             }
+            if self._device_id:
+                reg_headers["oai-device-id"] = self._device_id
             reg_headers.update(_make_trace_headers())
 
             response = self.session.post(
@@ -589,7 +596,10 @@ class RegistrationEngine:
                 "referer": "https://auth.openai.com/create-account/password",
                 "origin": "https://auth.openai.com",
                 "accept": "application/json",
+                "user-agent": self._OAUTH_UA,
             }
+            if self._device_id:
+                otp_send_headers["oai-device-id"] = self._device_id
             otp_send_headers.update(_make_trace_headers())
 
             response = self.session.get(
@@ -637,7 +647,10 @@ class RegistrationEngine:
                 "origin": "https://auth.openai.com",
                 "accept": "application/json",
                 "content-type": "application/json",
+                "user-agent": self._OAUTH_UA,
             }
+            if self._device_id:
+                otp_headers["oai-device-id"] = self._device_id
             otp_headers.update(_make_trace_headers())
 
             response = self.session.post(
@@ -680,7 +693,10 @@ class RegistrationEngine:
                 "origin": "https://auth.openai.com",
                 "accept": "application/json",
                 "content-type": "application/json",
+                "user-agent": self._OAUTH_UA,
             }
+            if self._device_id:
+                headers["oai-device-id"] = self._device_id
             headers.update(_make_trace_headers())
 
             response = self.session.post(
