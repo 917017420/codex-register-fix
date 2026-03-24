@@ -486,7 +486,31 @@ class RegistrationEngine:
             if response.status_code != 200:
                 # 详细记录 403 响应内容，便于调试
                 resp_body = response.text[:500] if response.text else "(empty)"
+                server = response.headers.get("server", "")
+                content_type = response.headers.get("content-type", "")
+                cf_ray = response.headers.get("cf-ray", "")
+                cf_mitigated = response.headers.get("cf-mitigated", "")
+                self._log(
+                    f"注册表单失败头部: server={server}, content-type={content_type}, "
+                    f"cf-ray={cf_ray}, cf-mitigated={cf_mitigated}",
+                    "warning"
+                )
                 self._log(f"注册表单失败详情: {resp_body}", "warning")
+
+                # Cloudflare 挑战页特征识别（常见于服务器/机房 IP）
+                lowered = (response.text or "").lower()
+                if (
+                    response.status_code == 403 and
+                    (
+                        "just a moment" in lowered or
+                        "cf-mitigated" in response.headers or
+                        "cloudflare" in (server or "").lower()
+                    )
+                ):
+                    self._log(
+                        "检测到 Cloudflare 挑战页拦截：当前出口 IP/网络环境可能触发风控",
+                        "warning"
+                    )
                 return SignupFormResult(
                     success=False,
                     error_message=f"HTTP {response.status_code}: {response.text[:200]}"
