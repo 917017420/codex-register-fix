@@ -5,12 +5,22 @@ SQLAlchemy ORM 模型定义
 from datetime import datetime
 from typing import Optional, Dict, Any
 import json
+import os
 from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import relationship
 
 Base = declarative_base()
+
+
+def _normalize_proxy_host_for_runtime(host: str) -> str:
+    """容器内将回环地址映射到宿主机代理地址。"""
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return host
+    if not os.path.exists("/.dockerenv"):
+        return host
+    return os.environ.get("DOCKER_HOST_INTERNAL", "host.docker.internal")
 
 
 class JSONEncodedDict(TypeDecorator):
@@ -227,4 +237,5 @@ class Proxy(Base):
         if self.username and self.password:
             auth = f"{self.username}:{self.password}@"
 
-        return f"{scheme}://{auth}{self.host}:{self.port}"
+        host = _normalize_proxy_host_for_runtime(self.host)
+        return f"{scheme}://{auth}{host}:{self.port}"

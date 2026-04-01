@@ -279,6 +279,7 @@ class TempMailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[set] = None,
     ) -> Optional[str]:
         """
         从 TempMail 邮箱获取验证码
@@ -297,6 +298,7 @@ class TempMailService(BaseEmailService):
 
         start_time = time.time()
         seen_mail_ids: set = set()
+        excluded = {str(code).strip() for code in (exclude_codes or set()) if str(code).strip()}
 
         # 优先使用用户级 JWT，回退到 admin API 先注释用户级API
         # cached = self._email_cache.get(email, {})
@@ -345,6 +347,8 @@ class TempMailService(BaseEmailService):
                     match = re.search(pattern, content)
                     if match:
                         code = match.group(1)
+                        if code in excluded:
+                            continue
                         logger.info(f"从 TempMail 邮箱 {email} 找到验证码: {code}")
                         self.update_status(True)
                         return code

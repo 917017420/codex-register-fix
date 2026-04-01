@@ -37,6 +37,15 @@ class SettingDefinition:
     is_secret: bool = False
 
 
+def _normalize_proxy_host_for_runtime(host: str) -> str:
+    """容器内将回环地址映射到宿主机代理地址。"""
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return host
+    if not os.path.exists("/.dockerenv"):
+        return host
+    return os.environ.get("DOCKER_HOST_INTERNAL", "host.docker.internal")
+
+
 # 所有配置项定义（包含数据库键名、默认值、分类、描述）
 SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     # 应用信息
@@ -655,7 +664,8 @@ class Settings(BaseModel):
         if self.proxy_username and self.proxy_password:
             auth = f"{self.proxy_username}:{self.proxy_password.get_secret_value()}@"
 
-        return f"{scheme}://{auth}{self.proxy_host}:{self.proxy_port}"
+        host = _normalize_proxy_host_for_runtime(self.proxy_host)
+        return f"{scheme}://{auth}{host}:{self.proxy_port}"
 
     # 注册配置
     registration_max_retries: int = 3

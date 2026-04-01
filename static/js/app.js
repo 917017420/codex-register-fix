@@ -40,6 +40,7 @@ let activeBatchId = null;    // 当前活跃的批量任务 ID（用于页面重
 const elements = {
     form: document.getElementById('registration-form'),
     emailService: document.getElementById('email-service'),
+    browserMode: document.getElementById('browser-mode'),
     regMode: document.getElementById('reg-mode'),
     regModeGroup: document.getElementById('reg-mode-group'),
     batchCountGroup: document.getElementById('batch-count-group'),
@@ -474,6 +475,7 @@ async function handleStartRegistration(e) {
     // 构建请求数据（代理从设置中自动获取）
     const requestData = {
         email_service_type: emailServiceType,
+        browser_mode: elements.browserMode ? elements.browserMode.value : 'protocol',
         auto_upload_cpa: elements.autoUploadCpa ? elements.autoUploadCpa.checked : false,
         cpa_service_ids: elements.autoUploadCpa && elements.autoUploadCpa.checked ? getSelectedServiceIds(elements.cpaServiceSelect) : [],
         auto_upload_sub2api: elements.autoUploadSub2api ? elements.autoUploadSub2api.checked : false,
@@ -1180,6 +1182,7 @@ async function handleOutlookBatchRegistration() {
     const requestData = {
         service_ids: selectedIds,
         skip_registered: skipRegistered,
+        browser_mode: elements.browserMode ? elements.browserMode.value : 'protocol',
         interval_min: intervalMin,
         interval_max: intervalMax,
         concurrency: Math.min(50, Math.max(1, concurrency)),

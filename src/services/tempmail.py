@@ -5,6 +5,7 @@ Tempmail.lol 邮箱服务实现
 import re
 import time
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import json
 
@@ -16,6 +17,35 @@ from ..config.constants import OTP_CODE_PATTERN
 
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_message_timestamp(raw_value: Any) -> float:
+    """将 Tempmail 的日期字段转换为秒级时间戳。"""
+    if raw_value in (None, ""):
+        return 0
+
+    if isinstance(raw_value, (int, float)):
+        value = float(raw_value)
+        return value / 1000 if value > 10**11 else value
+
+    text = str(raw_value).strip()
+    if not text:
+        return 0
+
+    try:
+        value = float(text)
+        return value / 1000 if value > 10**11 else value
+    except ValueError:
+        pass
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return 0
 
 
 class TempmailService(BaseEmailService):
@@ -125,6 +155,7 @@ class TempmailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[set] = None,
     ) -> Optional[str]:
         """
         从 Tempmail.lol 获取验证码
@@ -134,7 +165,7 @@ class TempmailService(BaseEmailService):
             email_id: 邮箱 token（如果不提供，从缓存中查找）
             timeout: 超时时间（秒）
             pattern: 验证码正则表达式
-            otp_sent_at: OTP 发送时间戳（Tempmail 服务暂不使用此参数）
+            otp_sent_at: OTP 发送时间戳，用于过滤旧邮件
 
         Returns:
             验证码字符串，如果超时或未找到返回 None
@@ -156,6 +187,10 @@ class TempmailService(BaseEmailService):
 
         start_time = time.time()
         seen_ids = set()
+        excluded = {str(code).strip() for code in (exclude_codes or set()) if str(code).strip()}
+        min_timestamp = (otp_sent_at - 60) if otp_sent_at else 0
+        logged_old_mail = False
+        logged_excluded_code = False
 
         while time.time() - start_time < timeout:
             try:
@@ -193,6 +228,15 @@ class TempmailService(BaseEmailService):
                         continue
                     seen_ids.add(msg_date)
 
+                    msg_ts = _normalize_message_timestamp(msg_date)
+                    if min_timestamp and msg_ts and msg_ts < min_timestamp:
+                        if not logged_old_mail:
+                            logger.info(
+                                f"跳过旧邮件: ts={int(msg_ts)}, min_ts={int(min_timestamp)}, email={email}"
+                            )
+                            logged_old_mail = True
+                        continue
+
                     sender = str(msg.get("from", "")).lower()
                     subject = str(msg.get("subject", ""))
                     body = str(msg.get("body", ""))
@@ -208,6 +252,11 @@ class TempmailService(BaseEmailService):
                     match = re.search(pattern, content)
                     if match:
                         code = match.group(1)
+                        if code in excluded:
+                            if not logged_excluded_code:
+                                logger.info(f"跳过已排除验证码: {code} ({email})")
+                                logged_excluded_code = True
+                            continue
                         logger.info(f"找到验证码: {code}")
                         self.update_status(True)
                         return code

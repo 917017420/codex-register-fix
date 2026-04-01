@@ -186,6 +186,16 @@
                                     </select>
                                 </div>
 
+                                <div class="form-group">
+                                    <label for="browser-mode">执行模式</label>
+                                    <select id="browser-mode" name="browser_mode">
+                                        <option value="protocol">纯协议</option>
+                                        <option value="headless">无头浏览器模式</option>
+                                        <option value="headed">有头浏览器模式</option>
+                                    </select>
+                                    <small style="color: var(--text-muted); font-size: 0.75rem;">当前仍走协议注册链路，执行模式主要影响请求节奏与兼容头。</small>
+                                </div>
+
                                 <!-- Outlook 批量注册区域 -->
                                 <div id="outlook-batch-section" style="display: none;">
                                     <div class="form-group">

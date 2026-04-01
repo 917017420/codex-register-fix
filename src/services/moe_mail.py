@@ -262,6 +262,7 @@ class MeoMailEmailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[set] = None,
     ) -> Optional[str]:
         """
         从自定义域名邮箱获取验证码
@@ -293,6 +294,7 @@ class MeoMailEmailService(BaseEmailService):
 
         start_time = time.time()
         seen_message_ids = set()
+        excluded = {str(code).strip() for code in (exclude_codes or set()) if str(code).strip()}
 
         while time.time() - start_time < timeout:
             try:
@@ -331,6 +333,8 @@ class MeoMailEmailService(BaseEmailService):
                     match = re.search(pattern, re.sub(email_pattern, "", content))
                     if match:
                         code = match.group(1)
+                        if code in excluded:
+                            continue
                         logger.info(f"从自定义域名邮箱 {email} 找到验证码: {code}")
                         self.update_status(True)
                         return code

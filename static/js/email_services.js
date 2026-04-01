@@ -77,7 +77,7 @@ const elements = {
 const CUSTOM_SUBTYPE_LABELS = {
     moemail: '🔗 MoeMail（自定义域名 API）',
     tempmail: '📮 TempMail（自部署 Cloudflare Worker）',
-    duckmail: '🦆 DuckMail（DuckMail API）',
+    duckmail: '🦆 DuckMail / YYDS Mail（兼容接口）',
     freemail: 'Freemail（自部署 Cloudflare Worker）',
     imap: '📧 IMAP 邮箱（Gmail/QQ/163等）'
 };
@@ -284,7 +284,7 @@ function getCustomServiceTypeBadge(subType) {
         return '<span class="status-badge warning">TempMail</span>';
     }
     if (subType === 'duckmail') {
-        return '<span class="status-badge success">DuckMail</span>';
+        return '<span class="status-badge success">Duck/YYDS</span>';
     }
     if (subType === 'freemail') {
         return '<span class="status-badge" style="background-color:#9c27b0;color:white;">Freemail</span>';

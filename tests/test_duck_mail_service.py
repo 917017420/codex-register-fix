@@ -141,3 +141,104 @@ def test_get_verification_code_reads_message_detail_and_extracts_code():
     assert detail_call["method"] == "GET"
     assert detail_call["url"] == "https://api.duckmail.test/messages/msg-1"
     assert detail_call["kwargs"]["headers"]["Authorization"] == "Bearer token-123"
+
+
+def test_create_email_supports_yyds_api_style_and_x_api_key():
+    service = DuckMailService({
+        "base_url": "https://maliapi.215.im/v1",
+        "api_key": "AC-test-key",
+    })
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            status_code=201,
+            payload={
+                "success": True,
+                "data": {
+                    "id": "acc-yyds-1",
+                    "address": "tester@public.example.com",
+                    "token": "temp-token-1",
+                },
+            },
+        ),
+    ])
+    service.http_client = fake_client
+
+    email_info = service.create_email({"name": "tester"})
+
+    assert email_info["email"] == "tester@public.example.com"
+    assert email_info["service_id"] == "acc-yyds-1"
+    assert email_info["token"] == "temp-token-1"
+    assert email_info["api_style"] == "yyds"
+
+    create_call = fake_client.calls[0]
+    assert create_call["url"] == "https://maliapi.215.im/v1/accounts"
+    assert create_call["kwargs"]["headers"]["X-API-Key"] == "AC-test-key"
+    assert "Authorization" not in create_call["kwargs"]["headers"]
+    assert create_call["kwargs"]["json"]["address"] == "tester"
+    assert "password" not in create_call["kwargs"]["json"]
+
+
+def test_get_verification_code_supports_yyds_message_shape():
+    service = DuckMailService({
+        "base_url": "https://maliapi.215.im/v1",
+        "api_key": "AC-test-key",
+    })
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            status_code=201,
+            payload={
+                "success": True,
+                "data": {
+                    "id": "acc-yyds-1",
+                    "address": "tester@public.example.com",
+                    "token": "temp-token-1",
+                },
+            },
+        ),
+        FakeResponse(
+            payload={
+                "success": True,
+                "data": {
+                    "messages": [
+                        {
+                            "id": "msg-yyds-1",
+                            "from": {
+                                "name": "OpenAI",
+                                "address": "noreply@openai.com",
+                            },
+                            "subject": "Your verification code",
+                            "createdAt": "2026-03-19T10:00:00Z",
+                        }
+                    ],
+                    "total": 1,
+                },
+            },
+        ),
+        FakeResponse(
+            payload={
+                "success": True,
+                "data": {
+                    "id": "msg-yyds-1",
+                    "text": "Your OpenAI verification code is 123456",
+                    "html": [],
+                },
+            },
+        ),
+    ])
+    service.http_client = fake_client
+
+    email_info = service.create_email({"name": "tester"})
+    code = service.get_verification_code(
+        email=email_info["email"],
+        email_id=email_info["service_id"],
+        timeout=1,
+    )
+
+    assert code == "123456"
+
+    messages_call = fake_client.calls[1]
+    assert messages_call["url"] == "https://maliapi.215.im/v1/messages"
+    assert messages_call["kwargs"]["headers"]["Authorization"] == "Bearer temp-token-1"
+
+    detail_call = fake_client.calls[2]
+    assert detail_call["url"] == "https://maliapi.215.im/v1/messages/msg-yyds-1"

@@ -209,7 +209,7 @@
                         <select id="custom-sub-type" name="sub_type">
                             <option value="moemail">MoeMail（自定义域名 API）</option>
                             <option value="tempmail">TempMail（自部署 Cloudflare Worker）</option>
-                            <option value="duckmail">DuckMail（DuckMail API）</option>
+                            <option value="duckmail">DuckMail / YYDS Mail（兼容接口）</option>
                             <option value="freemail">Freemail（自部署 Cloudflare Worker）</option>
                             <option value="imap">标准 IMAP（Gmail/QQ/163等）</option>
                         </select>
@@ -248,14 +248,14 @@
                     <div id="add-duckmail-fields" style="display:none;">
                         <div class="form-group">
                             <label for="custom-dm-base-url">API 地址</label>
-                            <input type="text" id="custom-dm-base-url" name="dm_base_url" placeholder="https://api.duckmail.sbs">
+                            <input type="text" id="custom-dm-base-url" name="dm_base_url" placeholder="https://maliapi.215.im/v1">
                         </div>
                         <div class="form-group">
                             <label for="custom-dm-api-key">API Key（可选）</label>
-                            <input type="text" id="custom-dm-api-key" name="dm_api_key" placeholder="dk_xxx">
+                            <input type="text" id="custom-dm-api-key" name="dm_api_key" placeholder="AC-xxxx（YYDS）/ dk_xxx（DuckMail）">
                         </div>
                         <div class="form-group">
-                            <label for="custom-dm-domain">默认域名</label>
+                            <label for="custom-dm-domain">默认域名（YYDS 可选）</label>
                             <input type="text" id="custom-dm-domain" name="dm_domain" placeholder="example.com">
                         </div>
                         <div class="form-group">
@@ -384,7 +384,7 @@
                     <div id="edit-duckmail-fields" style="display:none;">
                         <div class="form-group">
                             <label for="edit-dm-base-url">API 地址</label>
-                            <input type="text" id="edit-dm-base-url" name="dm_base_url" placeholder="https://api.duckmail.sbs">
+                            <input type="text" id="edit-dm-base-url" name="dm_base_url" placeholder="https://maliapi.215.im/v1">
                         </div>
                         <div class="form-group">
                             <label for="edit-dm-api-key">API Key</label>
@@ -392,7 +392,7 @@
                             <small style="color: var(--text-muted);">留空则保持原值不变</small>
                         </div>
                         <div class="form-group">
-                            <label for="edit-dm-domain">默认域名</label>
+                            <label for="edit-dm-domain">默认域名（YYDS 可选）</label>
                             <input type="text" id="edit-dm-domain" name="dm_domain" placeholder="example.com">
                         </div>
                         <div class="form-group">

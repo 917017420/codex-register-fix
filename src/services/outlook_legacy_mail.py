@@ -463,6 +463,7 @@ class OutlookService(BaseEmailService):
         timeout: int = None,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[set] = None,
     ) -> Optional[str]:
         """
         从 Outlook 邮箱获取验证码
@@ -473,6 +474,7 @@ class OutlookService(BaseEmailService):
             timeout: 超时时间（秒），默认使用配置值
             pattern: 验证码正则表达式
             otp_sent_at: OTP 发送时间戳，用于过滤旧邮件
+            exclude_codes: 需要排除的验证码集合
 
         Returns:
             验证码字符串，如果超时或未找到返回 None
@@ -499,6 +501,8 @@ class OutlookService(BaseEmailService):
         if email not in self._used_codes:
             self._used_codes[email] = set()
         used_codes = self._used_codes[email]
+        if exclude_codes:
+            used_codes.update(str(code).strip() for code in exclude_codes if str(code).strip())
 
         # 计算最小时间戳（留出 60 秒时钟偏差）
         min_timestamp = (otp_sent_at - 60) if otp_sent_at else 0

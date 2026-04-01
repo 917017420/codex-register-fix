@@ -184,6 +184,7 @@ class FreemailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[set] = None,
     ) -> Optional[str]:
         """
         从 Freemail 邮箱获取验证码
@@ -202,6 +203,7 @@ class FreemailService(BaseEmailService):
 
         start_time = time.time()
         seen_mail_ids: set = set()
+        excluded = {str(code).strip() for code in (exclude_codes or set()) if str(code).strip()}
 
         while time.time() - start_time < timeout:
             try:
@@ -229,6 +231,8 @@ class FreemailService(BaseEmailService):
                     # 尝试直接使用 Freemail 提取的验证码
                     v_code = mail.get("verification_code")
                     if v_code:
+                        if str(v_code).strip() in excluded:
+                            continue
                         logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {v_code}")
                         self.update_status(True)
                         return v_code
@@ -237,6 +241,8 @@ class FreemailService(BaseEmailService):
                     match = re.search(pattern, content)
                     if match:
                         code = match.group(1)
+                        if code in excluded:
+                            continue
                         logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {code}")
                         self.update_status(True)
                         return code
@@ -248,6 +254,8 @@ class FreemailService(BaseEmailService):
                         match = re.search(pattern, full_content)
                         if match:
                             code = match.group(1)
+                            if code in excluded:
+                                continue
                             logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {code}")
                             self.update_status(True)
                             return code

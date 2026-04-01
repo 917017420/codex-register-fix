@@ -112,6 +112,8 @@ def generate_token_json(
         "id_token": account.id_token or "",
         "account_id": account.account_id or "",
         "access_token": account.access_token or "",
+        "session_token": getattr(account, "session_token", "") or "",
+        "client_id": getattr(account, "client_id", "") or "",
         "last_refresh": account.last_refresh.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.last_refresh else "",
         "refresh_token": account.refresh_token or "",
     }

@@ -123,6 +123,16 @@ def main():
     parser.add_argument("--access-password", help="Web UI 访问密钥 (也可通过 WEBUI_ACCESS_PASSWORD 环境变量设置)")
     args = parser.parse_args()
 
+    # 确保数据库已初始化，再处理命令行配置覆盖，避免读取到默认缓存值。
+    _load_dotenv()
+    data_dir = project_root / "data"
+    logs_dir = project_root / "logs"
+    data_dir.mkdir(exist_ok=True)
+    logs_dir.mkdir(exist_ok=True)
+    os.environ.setdefault("APP_DATA_DIR", str(data_dir))
+    os.environ.setdefault("APP_LOGS_DIR", str(logs_dir))
+    initialize_database()
+
     # 更新配置
     from src.config.settings import update_settings
 

@@ -20,6 +20,14 @@ from datetime import datetime
 from curl_cffi import requests as cffi_requests
 
 from .openai.oauth import OAuthManager, OAuthStart
+from .openai.chatgpt_register_v2 import ChatGPTClient as ChatGPTRegisterClientV2
+from .openai.oauth_login_v2 import OAuthLoginConfig, OAuthLoginV2
+from .openai.session_reuse_v2 import (
+    FlowState,
+    SessionReuseClient,
+    describe_flow_state,
+    extract_flow_state,
+)
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
 from ..database import crud
@@ -28,6 +36,8 @@ from ..config.constants import (
     OPENAI_API_ENDPOINTS,
     OPENAI_PAGE_TYPES,
     generate_random_user_info,
+    FIRST_NAMES,
+    LAST_NAMES,
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
     PASSWORD_CHARSET,
@@ -38,6 +48,13 @@ from ..config.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
+SUPPORTED_BROWSER_MODES = {"protocol", "headless", "headed"}
+
+
+def _normalize_browser_mode(browser_mode: Optional[str]) -> str:
+    """规范化执行模式，未知值回落到 protocol。"""
+    mode = str(browser_mode or "protocol").strip().lower()
+    return mode if mode in SUPPORTED_BROWSER_MODES else "protocol"
 
 
 def _make_trace_headers():
@@ -210,6 +227,20 @@ def _extract_code_from_url(url: str) -> Optional[str]:
         return None
 
 
+def _token_preview(token: Any, prefix: int = 12) -> str:
+    raw = str(token or "").strip()
+    if not raw:
+        return "missing"
+    return f"len={len(raw)}, prefix={raw[:prefix]}..."
+
+
+def _format_token_snapshot(token_map: Dict[str, Any]) -> str:
+    parts = []
+    for key in ("access_token", "session_token", "refresh_token", "id_token"):
+        parts.append(f"{key}={_token_preview(token_map.get(key, ''))}")
+    return ", ".join(parts)
+
+
 @dataclass
 class RegistrationResult:
     """注册结果"""
@@ -256,6 +287,42 @@ class SignupFormResult:
     error_message: str = ""
 
 
+class _EmailServiceV2Adapter:
+    """为 V2 注册状态机适配 old 项目的接码接口。"""
+
+    def __init__(
+        self,
+        email_service: BaseEmailService,
+        email: str,
+        email_info: Optional[Dict[str, Any]],
+        log_fn: Callable[[str], None],
+        used_codes: Optional[set] = None,
+    ):
+        self.email_service = email_service
+        self.email = email
+        self.email_info = email_info or {}
+        self.log_fn = log_fn
+        self.used_codes = used_codes if used_codes is not None else set()
+
+    def wait_for_verification_code(self, email: str, timeout: int = 60, otp_sent_at: Optional[float] = None, exclude_codes=None):
+        self.log_fn(f"正在等待邮箱 {email} 的验证码 ({timeout}s)...")
+        ignored_codes = set(self.used_codes)
+        if exclude_codes:
+            ignored_codes.update(str(code).strip() for code in exclude_codes if str(code).strip())
+        code = self.email_service.get_verification_code(
+            email=self.email,
+            email_id=self.email_info.get("service_id"),
+            timeout=timeout,
+            pattern=OTP_CODE_PATTERN,
+            otp_sent_at=otp_sent_at,
+            exclude_codes=ignored_codes,
+        )
+        if code:
+            self.used_codes.add(code)
+            self.log_fn(f"成功获取验证码: {code}")
+        return code
+
+
 class RegistrationEngine:
     """
     注册引擎
@@ -266,6 +333,7 @@ class RegistrationEngine:
         self,
         email_service: BaseEmailService,
         proxy_url: Optional[str] = None,
+        browser_mode: str = "protocol",
         callback_logger: Optional[Callable[[str], None]] = None,
         task_uuid: Optional[str] = None
     ):
@@ -275,11 +343,13 @@ class RegistrationEngine:
         Args:
             email_service: 邮箱服务实例
             proxy_url: 代理 URL
+            browser_mode: 执行模式（protocol | headless | headed）
             callback_logger: 日志回调函数
             task_uuid: 任务 UUID（用于数据库记录）
         """
         self.email_service = email_service
         self.proxy_url = proxy_url
+        self.browser_mode = _normalize_browser_mode(browser_mode)
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
 
@@ -307,8 +377,17 @@ class RegistrationEngine:
         self.logs: list = []
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
+        self._used_verification_codes: set = set()  # 跨注册/登录阶段去重
         self._otp_continue_url: Optional[str] = None  # OTP 验证后的 continue_url
+        self._post_auth_continue_url: Optional[str] = None  # 注册完成后的 continue_url
+        self._otp_flow_state: Optional[FlowState] = None  # OTP 验证后的流程状态
+        self._post_auth_flow_state: Optional[FlowState] = None  # 创建账户后的流程状态
         self._device_id: Optional[str] = None  # Device ID，所有 API 请求共用
+        self._last_oauth_follow_url: Optional[str] = None  # OAuth 跟随后实际落地的 URL
+        self._callback_url_from_consent: Optional[str] = None  # 免登录 OAuth 直接拿到的 callback URL
+        self._profile_first_name: str = ""
+        self._profile_last_name: str = ""
+        self._profile_birthdate: str = ""
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -337,6 +416,17 @@ class RegistrationEngine:
             logger.warning(message)
         else:
             logger.info(message)
+
+    def _browser_pause(
+        self,
+        headless_range: Tuple[float, float] = (0.05, 0.15),
+        headed_range: Tuple[float, float] = (0.18, 0.45),
+    ):
+        """为不同执行模式注入轻微节奏差异。"""
+        if self.browser_mode == "headed":
+            time.sleep(random.uniform(*headed_range))
+        elif self.browser_mode == "headless":
+            time.sleep(random.uniform(*headless_range))
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         """生成随机密码"""
@@ -390,6 +480,7 @@ class RegistrationEngine:
 
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID"""
+        self._browser_pause()
         if not self.oauth_start:
             return None
 
@@ -453,6 +544,7 @@ class RegistrationEngine:
         Returns:
             SignupFormResult: 提交结果，包含账号状态判断
         """
+        self._browser_pause()
         try:
             headers = {
                 "referer": "https://auth.openai.com/create-account",
@@ -486,7 +578,31 @@ class RegistrationEngine:
             if response.status_code != 200:
                 # 详细记录 403 响应内容，便于调试
                 resp_body = response.text[:500] if response.text else "(empty)"
+                server = response.headers.get("server", "")
+                content_type = response.headers.get("content-type", "")
+                cf_ray = response.headers.get("cf-ray", "")
+                cf_mitigated = response.headers.get("cf-mitigated", "")
+                self._log(
+                    f"注册表单失败头部: server={server}, content-type={content_type}, "
+                    f"cf-ray={cf_ray}, cf-mitigated={cf_mitigated}",
+                    "warning"
+                )
                 self._log(f"注册表单失败详情: {resp_body}", "warning")
+
+                # Cloudflare 挑战页特征识别（常见于服务器/机房 IP）
+                lowered = (response.text or "").lower()
+                if (
+                    response.status_code == 403 and
+                    (
+                        "just a moment" in lowered or
+                        "cf-mitigated" in response.headers or
+                        "cloudflare" in (server or "").lower()
+                    )
+                ):
+                    self._log(
+                        "检测到 Cloudflare 挑战页拦截：当前出口 IP/网络环境可能触发风控",
+                        "warning"
+                    )
                 return SignupFormResult(
                     success=False,
                     error_message=f"HTTP {response.status_code}: {response.text[:200]}"
@@ -523,6 +639,7 @@ class RegistrationEngine:
 
     def _register_password(self) -> Tuple[bool, Optional[str]]:
         """注册密码"""
+        self._browser_pause()
         try:
             # 生成密码
             password = self._generate_password()
@@ -602,6 +719,7 @@ class RegistrationEngine:
 
     def _send_verification_code(self) -> bool:
         """发送验证码"""
+        self._browser_pause()
         try:
             # 记录发送时间戳
             self._otp_sent_at = time.time()
@@ -644,9 +762,11 @@ class RegistrationEngine:
                 timeout=120,
                 pattern=OTP_CODE_PATTERN,
                 otp_sent_at=self._otp_sent_at,
+                exclude_codes=self._used_verification_codes,
             )
 
             if code:
+                self._used_verification_codes.add(code)
                 self._log(f"成功获取验证码: {code}")
                 return code
             else:
@@ -659,6 +779,7 @@ class RegistrationEngine:
 
     def _validate_verification_code(self, code: str) -> bool:
         """验证验证码"""
+        self._browser_pause()
         try:
             otp_headers = {
                 "referer": "https://auth.openai.com/email-verification",
@@ -689,12 +810,18 @@ class RegistrationEngine:
             # 解析响应，提取 continue_url 以便后续跟随重定向获取完整 cookie
             try:
                 resp_data = response.json()
-                continue_url = (resp_data or {}).get("continue_url") or \
-                               (resp_data or {}).get("url") or \
-                               (resp_data or {}).get("redirect_url")
+                flow_state = extract_flow_state(
+                    data=resp_data,
+                    current_url=str(response.url) or "https://auth.openai.com/about-you",
+                    auth_base="https://auth.openai.com",
+                )
+                self._otp_flow_state = flow_state
+                self._post_auth_flow_state = flow_state
+                continue_url = flow_state.continue_url
                 if continue_url:
                     self._otp_continue_url = continue_url
-                    self._log(f"验证码响应包含 continue_url: {continue_url[:100]}...")
+                    self._post_auth_continue_url = continue_url
+                    self._log(f"验证码响应状态: {describe_flow_state(flow_state)}")
             except Exception:
                 pass
 
@@ -706,61 +833,98 @@ class RegistrationEngine:
 
     def _create_user_account(self) -> bool:
         """创建用户账户"""
+        self._browser_pause()
         try:
-            user_info = generate_random_user_info()
-            self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
+            for attempt in range(2):
+                current_year = datetime.now().year
+                user_info = {
+                    "name": f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}",
+                    "birthdate": f"{random.randint(current_year - 30, current_year - 20):04d}-"
+                                 f"{random.randint(1, 12):02d}-"
+                                 f"{random.randint(1, 28):02d}",
+                }
+                self._log(
+                    f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}"
+                    f"{' (重试)' if attempt > 0 else ''}"
+                )
 
-            headers = {
-                "referer": "https://auth.openai.com/about-you",
-                "origin": "https://auth.openai.com",
-                "accept": "application/json",
-                "content-type": "application/json",
-                "user-agent": self._OAUTH_UA,
-                "sec-ch-ua": '"Not:A-Brand";v="99", "Google Chrome";v="131", "Chromium";v="131"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-            }
-            if self._device_id:
-                headers["oai-device-id"] = self._device_id
-            headers.update(_make_trace_headers())
+                headers = {
+                    "referer": "https://auth.openai.com/about-you",
+                    "origin": "https://auth.openai.com",
+                    "accept": "application/json",
+                    "accept-language": "en-US,en;q=0.9",
+                    "content-type": "application/json",
+                    "user-agent": self._OAUTH_UA,
+                    "sec-ch-ua": '"Not:A-Brand";v="99", "Google Chrome";v="131", "Chromium";v="131"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                }
+                if self._device_id:
+                    headers["oai-device-id"] = self._device_id
 
-            response = self.session.post(
-                OPENAI_API_ENDPOINTS["create_account"],
-                headers=headers,
-                json=user_info,
-                impersonate="chrome131",
-            )
+                sentinel_token = None
+                if self._device_id:
+                    sentinel_token = _build_sentinel_token(
+                        self.session,
+                        self._device_id,
+                        flow="authorize_continue",
+                        user_agent=self._OAUTH_UA,
+                        sec_ch_ua=headers["sec-ch-ua"],
+                        impersonate="chrome131",
+                    )
+                if sentinel_token:
+                    headers["openai-sentinel-token"] = sentinel_token
+                    self._log("create_account: 已附加 sentinel token")
+                else:
+                    self._log("create_account: sentinel token 生成失败，降级继续", "warning")
 
-            self._log(f"账户创建状态: {response.status_code}")
+                headers.update(_make_trace_headers())
 
-            if response.status_code != 200:
-                self._log(f"账户创建失败: {response.text[:200]}", "warning")
+                response = self.session.post(
+                    OPENAI_API_ENDPOINTS["create_account"],
+                    headers=headers,
+                    json=user_info,
+                    impersonate="chrome131",
+                )
+
+                self._log(f"账户创建状态: {response.status_code}")
+
+                if response.status_code == 200:
+                    break
+
+                body_preview = response.text[:300]
+                self._log(f"账户创建失败: {body_preview}", "warning")
+                if (
+                    response.status_code == 400
+                    and "registration_disallowed" in (response.text or "")
+                    and attempt == 0
+                ):
+                    self._log("检测到 registration_disallowed，刷新个人信息与 sentinel 后重试一次", "warning")
+                    continue
+                return False
+            else:
                 return False
 
             # 解析响应中的 continue_url 并跟随重定向，
-            # 以获取包含 workspaces 信息的 oai-client-auth-session cookie
+            # 记录流程状态，后续统一交给 V2 Session Reuse 逻辑处理
             try:
                 resp_data = response.json()
-                continue_url = (resp_data or {}).get("continue_url") or \
-                               (resp_data or {}).get("url") or \
-                               (resp_data or {}).get("redirect_url")
+                flow_state = extract_flow_state(
+                    data=resp_data,
+                    current_url=str(response.url) or "https://chatgpt.com/",
+                    auth_base="https://auth.openai.com",
+                )
+                self._post_auth_flow_state = flow_state
+                continue_url = flow_state.continue_url
                 if continue_url:
-                    self._log(f"跟随 create_account continue_url: {continue_url[:100]}...")
-                    self.session.get(
-                        continue_url,
-                        headers={
-                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "upgrade-insecure-requests": "1",
-                            "referer": "https://auth.openai.com/about-you",
-                        },
-                        allow_redirects=True,
-                        timeout=30,
-                    )
-                    self._log("continue_url 跟随完成")
+                    self._post_auth_continue_url = continue_url
+                    self._log(f"create_account 响应状态: {describe_flow_state(flow_state)}")
                 else:
                     self._log("create_account 响应中未包含 continue_url", "warning")
             except Exception as e:
-                self._log(f"跟随 continue_url 失败: {e}", "warning")
+                self._log(f"解析 create_account 响应状态失败: {e}", "warning")
 
             return True
 
@@ -804,6 +968,8 @@ class RegistrationEngine:
             # 手动跟随重定向，寻找 callback URL 中的 code
             current_url = auth_url
             max_redirects = 15
+            self._callback_url_from_consent = None
+            self._last_oauth_follow_url = auth_url
 
             for i in range(max_redirects):
                 response = self.session.get(
@@ -815,6 +981,7 @@ class RegistrationEngine:
                     allow_redirects=False,
                     timeout=30,
                 )
+                self._last_oauth_follow_url = str(response.url) or current_url
 
                 location = response.headers.get("Location", "")
 
@@ -867,6 +1034,47 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"OAuth 重新授权失败: {e}", "error")
             return False
+
+    def _reauthorize_authenticated_session(self) -> Optional[Dict[str, Any]]:
+        """利用当前已认证 session 重新发起 OAuth 授权，避免再次走完整登录链路。"""
+        self._browser_pause()
+        self._log("[Consent Reauth] 尝试基于已认证会话重新发起 OAuth 授权...")
+
+        visited = self._visit_consent_page()
+        callback_url = str(getattr(self, "_callback_url_from_consent", "") or "").strip()
+        if visited and callback_url:
+            self._log("[Consent Reauth] 已从重定向链直接拿到 callback URL")
+            return self._handle_oauth_callback(callback_url)
+
+        consent_url = str(
+            self._last_oauth_follow_url
+            or "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        ).strip()
+        session_data = self._load_workspace_session_data(consent_url)
+        if not session_data:
+            self._log("[Consent Reauth] 无法获取 consent session 数据", "warning")
+            return None
+
+        workspaces = session_data.get("workspaces") or []
+        if not workspaces:
+            self._log(f"[Consent Reauth] consent session 无 workspaces, keys={list(session_data.keys())}", "warning")
+            return None
+
+        workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+        if not workspace_id:
+            self._log("[Consent Reauth] workspace_id 为空", "warning")
+            return None
+
+        self._log(f"[Consent Reauth] Workspace ID: {workspace_id}")
+        continue_url = self._select_workspace(workspace_id)
+        if not continue_url:
+            return None
+
+        callback_url = self._follow_redirects(continue_url)
+        if not callback_url:
+            return None
+
+        return self._handle_oauth_callback(callback_url)
 
     # ========================================================================
     # OAuth 登录流程（注册完成后获取 Token）
@@ -924,6 +1132,7 @@ class RegistrationEngine:
         if referer:
             headers["Referer"] = referer
         current_url = start_url
+        self._last_oauth_follow_url = start_url
         for hop in range(max_hops):
             try:
                 resp = self.session.get(current_url, headers=headers,
@@ -932,11 +1141,13 @@ class RegistrationEngine:
                 # curl_cffi throws on localhost redirect
                 maybe_localhost = re.search(r'(https?://localhost[^\s\'"]+)', str(e))
                 if maybe_localhost:
+                    self._last_oauth_follow_url = maybe_localhost.group(1)
                     code = _extract_code_from_url(maybe_localhost.group(1))
                     if code:
                         return code
                 return None
             final_url = str(resp.url)
+            self._last_oauth_follow_url = final_url or current_url
             code = _extract_code_from_url(final_url)
             if code:
                 return code
@@ -946,6 +1157,7 @@ class RegistrationEngine:
                     return None
                 if loc.startswith("/"):
                     loc = f"{AUTH_ISSUER}{loc}"
+                self._last_oauth_follow_url = loc
                 code = _extract_code_from_url(loc)
                 if code:
                     return code
@@ -955,11 +1167,157 @@ class RegistrationEngine:
             return None
         return None
 
+    def _fetch_consent_page_html(self, consent_url: str) -> str:
+        """获取 consent 页 HTML，用于解析其中的 workspace session 数据。"""
+        AUTH_ISSUER = "https://auth.openai.com"
+        target_url = consent_url or f"{AUTH_ISSUER}/sign-in-with-chatgpt/codex/consent"
+        if target_url.startswith("/"):
+            target_url = f"{AUTH_ISSUER}{target_url}"
+
+        try:
+            response = self.session.get(
+                target_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": f"{AUTH_ISSUER}/email-verification",
+                    "Upgrade-Insecure-Requests": "1",
+                    "User-Agent": self._OAUTH_UA,
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+        except Exception:
+            return ""
+
+        self._last_oauth_follow_url = str(response.url) or target_url
+        content_type = (response.headers.get("content-type", "") or "").lower()
+        if response.status_code == 200 and "text/html" in content_type:
+            return response.text
+        return ""
+
+    def _extract_session_data_from_consent_html(self, html: str) -> Optional[Dict[str, Any]]:
+        """从 consent HTML 的 React Router stream 中提取 workspace/session 数据。"""
+        if not html or "workspaces" not in html:
+            return None
+
+        def _first_match(patterns, text):
+            for pattern in patterns:
+                matched = re.search(pattern, text, re.S)
+                if matched:
+                    return matched.group(1)
+            return ""
+
+        def _build_from_text(text: str) -> Optional[Dict[str, Any]]:
+            if not text or "workspaces" not in text:
+                return None
+
+            normalized = text.replace('\\"', '"')
+            session_id = _first_match(
+                [
+                    r'"session_id","([^"]+)"',
+                    r'"session_id":"([^"]+)"',
+                ],
+                normalized,
+            )
+            client_id = _first_match(
+                [
+                    r'"openai_client_id","([^"]+)"',
+                    r'"openai_client_id":"([^"]+)"',
+                ],
+                normalized,
+            )
+
+            start = normalized.find('"workspaces"')
+            if start < 0:
+                start = normalized.find("workspaces")
+            if start < 0:
+                return None
+
+            end = normalized.find('"openai_client_id"', start)
+            if end < 0:
+                end = normalized.find("openai_client_id", start)
+            if end < 0:
+                end = min(len(normalized), start + 4000)
+            else:
+                end = min(len(normalized), end + 600)
+
+            workspace_chunk = normalized[start:end]
+            ids = re.findall(r'"id"(?:,|:)"([0-9a-fA-F-]{36})"', workspace_chunk)
+            if not ids:
+                return None
+
+            kinds = re.findall(r'"kind"(?:,|:)"([^"]+)"', workspace_chunk)
+            workspaces = []
+            seen = set()
+            for idx, workspace_id in enumerate(ids):
+                if workspace_id in seen:
+                    continue
+                seen.add(workspace_id)
+                item = {"id": workspace_id}
+                if idx < len(kinds):
+                    item["kind"] = kinds[idx]
+                workspaces.append(item)
+
+            if not workspaces:
+                return None
+
+            return {
+                "session_id": session_id,
+                "openai_client_id": client_id,
+                "workspaces": workspaces,
+            }
+
+        candidates = [html]
+
+        for quoted in re.findall(
+            r'streamController\.enqueue\(("(?:\\.|[^"\\])*")\)',
+            html,
+            re.S,
+        ):
+            try:
+                decoded = json.loads(quoted)
+            except Exception:
+                continue
+            if decoded:
+                candidates.append(decoded)
+
+        if '\\"' in html:
+            candidates.append(html.replace('\\"', '"'))
+
+        for candidate in candidates:
+            parsed = _build_from_text(candidate)
+            if parsed and parsed.get("workspaces"):
+                return parsed
+
+        return None
+
+    def _load_workspace_session_data(self, consent_url: str) -> Optional[Dict[str, Any]]:
+        """优先从 cookie 解码 session，失败时回退到 consent HTML。"""
+        session_data = self._decode_session_cookie()
+        if session_data and session_data.get("workspaces"):
+            return session_data
+
+        html = self._fetch_consent_page_html(consent_url)
+        if not html:
+            return session_data
+
+        parsed = self._extract_session_data_from_consent_html(html)
+        if parsed and parsed.get("workspaces"):
+            if session_data:
+                merged = dict(session_data)
+                merged.update(parsed)
+            else:
+                merged = parsed
+            self._log(f"[OAuth Login] 从 consent HTML 提取到 {len(merged.get('workspaces', []))} 个 workspace")
+            return merged
+
+        return session_data
+
     def _oauth_submit_workspace_and_org(self, consent_url: str, did: str) -> Optional[str]:
         """选择 workspace 和 org，提取 authorization code"""
         AUTH_ISSUER = "https://auth.openai.com"
 
-        session_data = self._decode_session_cookie()
+        session_data = self._load_workspace_session_data(consent_url)
         if not session_data:
             self._log("[OAuth Login] 无法解码 session cookie", "warning")
             return None
@@ -1071,398 +1429,57 @@ class RegistrationEngine:
 
         return None
 
-    def _perform_oauth_login(self) -> Optional[Dict[str, Any]]:
-        """
-        注册完成后执行完整的 OAuth 登录流程，获取 workspace 和 token。
-        等效于当前项目的 perform_codex_oauth_login_http()。
+    def _perform_oauth_login(self, replace_session: bool = False, preferred_workspace_id: str = "") -> Optional[Dict[str, Any]]:
+        """注册完成后执行 V2 OAuth 登录状态机，获取授权 token。"""
+        oauth_session = cffi_requests.Session(impersonate="chrome131")
+        self._log("[OAuth Login] 创建独立 ChatGPT 登录会话，避免复用注册态触发异常")
 
-        Returns:
-            token 字典（含 access_token, refresh_token, id_token），失败返回 None
-        """
-        from ..config.constants import (
-            OAUTH_AUTH_URL, OAUTH_REDIRECT_URI, OAUTH_SCOPE, OAUTH_CLIENT_ID,
+        if self.proxy_url:
+            oauth_session.proxies = {"http": self.proxy_url, "https": self.proxy_url}
+        oauth_session.headers.update({
+            "User-Agent": self._OAUTH_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+            "sec-ch-ua": '"Not:A-Brand";v="99", "Google Chrome";v="131", "Chromium";v="131"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        })
+
+        settings = get_settings()
+        runner = OAuthLoginV2(
+            session=oauth_session,
+            email=self.email or "",
+            password=self.password or "",
+            email_service=self.email_service,
+            email_info=self.email_info or {},
+            device_id=str(self._device_id or oauth_session.cookies.get("oai-did") or uuid.uuid4()),
+            config=OAuthLoginConfig(
+                oauth_issuer=settings.openai_auth_url.rsplit("/oauth/authorize", 1)[0]
+                if settings.openai_auth_url.endswith("/oauth/authorize")
+                else "https://auth.openai.com",
+                oauth_client_id=settings.openai_client_id,
+                oauth_redirect_uri=settings.openai_redirect_uri,
+                oauth_scope=settings.openai_scope,
+                user_agent=self._OAUTH_UA,
+                sec_ch_ua='"Not:A-Brand";v="99", "Google Chrome";v="131", "Chromium";v="131"',
+                browser_mode=self.browser_mode,
+                impersonate="chrome131",
+            ),
+            logger=lambda message: self._log(f"[OAuth Login] {message}"),
+            sentinel_builder=_build_sentinel_token,
+            preferred_workspace_id=preferred_workspace_id,
+            excluded_otp_codes=set(self._used_verification_codes),
+            first_name=self._profile_first_name,
+            last_name=self._profile_last_name,
+            birthdate=self._profile_birthdate,
         )
-        from .openai.oauth import _pkce_verifier, _sha256_b64url_no_pad
-
-        AUTH_ISSUER = "https://auth.openai.com"
-        UA = self._OAUTH_UA
-
-        self._log("[OAuth Login] 开始执行 OAuth 登录流程...")
-
-        # 清除注册流程留下的 auth cookies，避免干扰新的 OAuth 登录
-        # 保留 oai-did（device ID）
-        cookies_to_remove = []
-        jar = getattr(self.session.cookies, "jar", None)
-        if jar is not None:
-            for c in list(jar):
-                name = getattr(c, "name", "") or ""
-                if name in ("login_session", "oai-client-auth-session",
-                            "__Host-next-auth.csrf-token",
-                            "__Secure-next-auth.callback-url",
-                            "__Secure-next-auth.session-token"):
-                    cookies_to_remove.append(c)
-            for c in cookies_to_remove:
-                jar.clear(getattr(c, "domain", ""), getattr(c, "path", "/"), c.name)
-        self._log(f"[OAuth Login] 清除了 {len(cookies_to_remove)} 个旧 auth cookies")
-
-        # 获取 / 设置 device_id
-        did = self.session.cookies.get("oai-did") or str(uuid.uuid4())
-        self.session.cookies.set("oai-did", did, domain=".auth.openai.com")
-        self.session.cookies.set("oai-did", did, domain="auth.openai.com")
-
-        # 生成新的 PKCE 参数
-        code_verifier = _pkce_verifier()
-        code_challenge = _sha256_b64url_no_pad(code_verifier)
-        state = secrets.token_urlsafe(24)
-
-        authorize_params = {
-            "response_type": "code",
-            "client_id": OAUTH_CLIENT_ID,
-            "redirect_uri": OAUTH_REDIRECT_URI,
-            "scope": OAUTH_SCOPE,
-            "state": state,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "prompt": "login",
-            "id_token_add_organizations": "true",
-            "codex_cli_simplified_flow": "true",
-        }
-        authorize_url = f"{AUTH_ISSUER}/oauth/authorize?{urllib.parse.urlencode(authorize_params)}"
-
-        def _oauth_json_headers(referer: str):
-            h = {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Origin": AUTH_ISSUER,
-                "Referer": referer,
-                "User-Agent": UA,
-                "oai-device-id": did,
-            }
-            h.update(_make_trace_headers())
-            return h
-
-        # ---- Step 1: Bootstrap OAuth session ----
-        self._log("[OAuth Login] 1/7 GET /oauth/authorize")
-        try:
-            r = self.session.get(authorize_url, headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": "https://chatgpt.com/",
-                "Upgrade-Insecure-Requests": "1",
-                "User-Agent": UA,
-            }, allow_redirects=True, timeout=30)
-        except Exception as e:
-            self._log(f"[OAuth Login] /oauth/authorize 异常: {e}", "error")
-            return None
-
-        authorize_final_url = str(r.url)
-        # Check if we got login_session cookie; if not, try oauth2/auth endpoint
-        has_login = any(getattr(c, "name", "") == "login_session"
-                        for c in self.session.cookies)
-        if not has_login:
-            oauth2_url = f"{AUTH_ISSUER}/api/oauth/oauth2/auth"
-            try:
-                r2 = self.session.get(oauth2_url, headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Referer": authorize_url,
-                    "Upgrade-Insecure-Requests": "1",
-                    "User-Agent": UA,
-                }, params=authorize_params, allow_redirects=True, timeout=30)
-                authorize_final_url = str(r2.url)
-            except Exception as e:
-                self._log(f"[OAuth Login] /api/oauth/oauth2/auth 异常: {e}", "warning")
-
-        continue_referer = (authorize_final_url
-                            if authorize_final_url.startswith(AUTH_ISSUER)
-                            else f"{AUTH_ISSUER}/log-in")
-
-        # ---- Step 2: POST /api/accounts/authorize/continue ----
-        self._log("[OAuth Login] 2/7 POST /api/accounts/authorize/continue")
-        sentinel_authorize = _build_sentinel_token(
-            self.session, did, flow="authorize_continue", user_agent=UA,
-        )
-        headers_continue = _oauth_json_headers(continue_referer)
-        if sentinel_authorize:
-            headers_continue["openai-sentinel-token"] = sentinel_authorize
-
-        try:
-            resp_continue = self.session.post(
-                f"{AUTH_ISSUER}/api/accounts/authorize/continue",
-                json={"username": {"kind": "email", "value": self.email}},
-                headers=headers_continue, timeout=30, allow_redirects=False,
-            )
-        except Exception as e:
-            self._log(f"[OAuth Login] authorize/continue 异常: {e}", "error")
-            return None
-
-        self._log(f"[OAuth Login] authorize/continue -> {resp_continue.status_code}")
-
-        # Handle invalid_auth_step by re-bootstrapping with aggressive cookie cleanup
-        if resp_continue.status_code == 400 and "invalid_auth_step" in (resp_continue.text or ""):
-            self._log("[OAuth Login] invalid_auth_step, 清除残留 cookies 并重新 bootstrap...")
-            # Aggressively clear ALL auth.openai.com cookies except oai-did
-            jar = getattr(self.session.cookies, "jar", None)
-            if jar is not None:
-                to_remove = []
-                for c in list(jar):
-                    name = getattr(c, "name", "") or ""
-                    if name != "oai-did":
-                        to_remove.append(c)
-                for c in to_remove:
-                    try:
-                        jar.clear(getattr(c, "domain", ""), getattr(c, "path", "/"), c.name)
-                    except Exception:
-                        pass
-                self._log(f"[OAuth Login] 重新 bootstrap: 清除了 {len(to_remove)} 个 cookies")
-            # Re-set oai-did
-            self.session.cookies.set("oai-did", did, domain=".auth.openai.com")
-            self.session.cookies.set("oai-did", did, domain="auth.openai.com")
-
-            try:
-                r = self.session.get(authorize_url, headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Referer": "https://chatgpt.com/",
-                    "Upgrade-Insecure-Requests": "1",
-                    "User-Agent": UA,
-                }, allow_redirects=True, timeout=30)
-                authorize_final_url = str(r.url)
-            except Exception as e:
-                self._log(f"[OAuth Login] bootstrap 重试异常: {e}", "error")
-                return None
-            # oauth2/auth fallback if login_session is still missing
-            has_login = any(getattr(c, "name", "") == "login_session"
-                           for c in self.session.cookies)
-            if not has_login:
-                try:
-                    r2 = self.session.get(f"{AUTH_ISSUER}/api/oauth/oauth2/auth", headers={
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Referer": authorize_url,
-                        "Upgrade-Insecure-Requests": "1",
-                        "User-Agent": UA,
-                    }, params=authorize_params, allow_redirects=True, timeout=30)
-                    authorize_final_url = str(r2.url)
-                except Exception:
-                    pass
-            continue_referer = (authorize_final_url
-                                if authorize_final_url.startswith(AUTH_ISSUER)
-                                else f"{AUTH_ISSUER}/log-in")
-            sentinel_authorize = _build_sentinel_token(
-                self.session, did, flow="authorize_continue", user_agent=UA,
-            )
-            headers_continue = _oauth_json_headers(continue_referer)
-            if sentinel_authorize:
-                headers_continue["openai-sentinel-token"] = sentinel_authorize
-            try:
-                resp_continue = self.session.post(
-                    f"{AUTH_ISSUER}/api/accounts/authorize/continue",
-                    json={"username": {"kind": "email", "value": self.email}},
-                    headers=headers_continue, timeout=30, allow_redirects=False,
-                )
-            except Exception as e:
-                self._log(f"[OAuth Login] authorize/continue 重试异常: {e}", "error")
-                return None
-
-        if resp_continue.status_code != 200:
-            self._log(
-                f"[OAuth Login] authorize/continue 非200: {resp_continue.status_code}, "
-                f"body={resp_continue.text[:220]}",
-                "error",
-            )
-            return None
-
-        try:
-            continue_data = resp_continue.json()
-        except Exception:
-            self._log("[OAuth Login] authorize/continue JSON 解析失败", "error")
-            return None
-
-        continue_url = continue_data.get("continue_url", "")
-        page_type = (continue_data.get("page") or {}).get("type", "")
-
-        # ---- Step 3: POST /api/accounts/password/verify ----
-        self._log("[OAuth Login] 3/7 POST /api/accounts/password/verify")
-        sentinel_pwd = _build_sentinel_token(
-            self.session, did, flow="password_verify", user_agent=UA,
-        )
-        headers_verify = _oauth_json_headers(f"{AUTH_ISSUER}/log-in/password")
-        if sentinel_pwd:
-            headers_verify["openai-sentinel-token"] = sentinel_pwd
-
-        try:
-            resp_verify = self.session.post(
-                f"{AUTH_ISSUER}/api/accounts/password/verify",
-                json={"password": self.password},
-                headers=headers_verify, timeout=30, allow_redirects=False,
-            )
-        except Exception as e:
-            self._log(f"[OAuth Login] password/verify 异常: {e}", "error")
-            return None
-
-        self._log(f"[OAuth Login] password/verify -> {resp_verify.status_code}")
-
-        if resp_verify.status_code != 200:
-            self._log(
-                f"[OAuth Login] password/verify 非200: {resp_verify.status_code}, "
-                f"body={resp_verify.text[:220]}",
-                "error",
-            )
-            return None
-
-        try:
-            verify_data = resp_verify.json()
-        except Exception:
-            self._log("[OAuth Login] password/verify JSON 解析失败", "error")
-            return None
-
-        continue_url = verify_data.get("continue_url", "") or continue_url
-        page_type = (verify_data.get("page") or {}).get("type", "") or page_type
-
-        # ---- Step 4: Handle OTP if needed ----
-        need_oauth_otp = (
-            page_type == "email_otp_verification"
-            or "email-verification" in (continue_url or "")
-            or "email-otp" in (continue_url or "")
-        )
-
-        if need_oauth_otp:
-            self._log("[OAuth Login] 4/7 检测到邮箱 OTP 验证")
-            headers_otp = _oauth_json_headers(f"{AUTH_ISSUER}/email-verification")
-            tried_codes: set = set()
-            otp_success = False
-            otp_deadline = time.time() + 120
-            # Record current time so email service filters out old (registration) OTP
-            oauth_otp_sent_at = time.time()
-
-            while time.time() < otp_deadline and not otp_success:
-                email_id = self.email_info.get("service_id") if self.email_info else None
-                try:
-                    code = self.email_service.get_verification_code(
-                        email=self.email,
-                        email_id=email_id,
-                        timeout=5,
-                        pattern=OTP_CODE_PATTERN,
-                        otp_sent_at=oauth_otp_sent_at,
-                    )
-                except Exception:
-                    code = None
-
-                if code and code not in tried_codes:
-                    tried_codes.add(code)
-                    self._log(f"[OAuth Login] 尝试 OTP: {code}")
-                    try:
-                        resp_otp = self.session.post(
-                            f"{AUTH_ISSUER}/api/accounts/email-otp/validate",
-                            json={"code": code}, headers=headers_otp,
-                            timeout=30, allow_redirects=False,
-                        )
-                    except Exception as e:
-                        self._log(f"[OAuth Login] email-otp/validate 异常: {e}", "warning")
-                        continue
-
-                    if resp_otp.status_code == 200:
-                        try:
-                            otp_data = resp_otp.json()
-                            continue_url = otp_data.get("continue_url", "") or continue_url
-                            page_type = (otp_data.get("page") or {}).get("type", "") or page_type
-                            otp_success = True
-                        except Exception:
-                            pass
-                    else:
-                        self._log(f"[OAuth Login] OTP 验证返回 {resp_otp.status_code}", "warning")
-                else:
-                    elapsed = int(120 - max(0, otp_deadline - time.time()))
-                    self._log(f"[OAuth Login] OTP 等待中... ({elapsed}s/120s)")
-                    time.sleep(3)
-
-            if not otp_success:
-                self._log("[OAuth Login] OAuth 阶段 OTP 验证失败", "error")
-                return None
-
-        # ---- Step 5-6: Follow consent/workspace/callback chain ----
-        code = None
-        consent_url = continue_url
-        if consent_url and consent_url.startswith("/"):
-            consent_url = f"{AUTH_ISSUER}{consent_url}"
-        if not consent_url and "consent" in page_type:
-            consent_url = f"{AUTH_ISSUER}/sign-in-with-chatgpt/codex/consent"
-        if consent_url:
-            code = _extract_code_from_url(consent_url)
-
-        if not code and consent_url:
-            self._log("[OAuth Login] 5/7 跟随 continue_url 提取 code")
-            code = self._oauth_follow_for_code(consent_url, referer=f"{AUTH_ISSUER}/log-in/password")
-
-        consent_hint = (
-            ("consent" in (consent_url or ""))
-            or ("sign-in-with-chatgpt" in (consent_url or ""))
-            or ("workspace" in (consent_url or ""))
-            or ("organization" in (consent_url or ""))
-            or ("consent" in page_type)
-            or ("organization" in page_type)
-        )
-
-        if not code and consent_hint:
-            if not consent_url:
-                consent_url = f"{AUTH_ISSUER}/sign-in-with-chatgpt/codex/consent"
-            self._log("[OAuth Login] 6/7 执行 workspace/org 选择")
-            code = self._oauth_submit_workspace_and_org(consent_url, did)
-
-        if not code:
-            fallback_consent = f"{AUTH_ISSUER}/sign-in-with-chatgpt/codex/consent"
-            self._log("[OAuth Login] 6/7 回退 consent 路径重试")
-            code = self._oauth_submit_workspace_and_org(fallback_consent, did)
-            if not code:
-                code = self._oauth_follow_for_code(
-                    fallback_consent, referer=f"{AUTH_ISSUER}/log-in/password",
-                )
-
-        if not code:
-            self._log("[OAuth Login] 未获取到 authorization code", "error")
-            return None
-
-        # ---- Step 7: Exchange code for tokens ----
-        self._log("[OAuth Login] 7/7 POST /oauth/token")
-        try:
-            token_resp = self.session.post(
-                f"{AUTH_ISSUER}/oauth/token",
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": UA,
-                },
-                data={
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": OAUTH_REDIRECT_URI,
-                    "client_id": OAUTH_CLIENT_ID,
-                    "code_verifier": code_verifier,
-                },
-                timeout=60,
-            )
-        except Exception as e:
-            self._log(f"[OAuth Login] /oauth/token 异常: {e}", "error")
-            return None
-
-        self._log(f"[OAuth Login] /oauth/token -> {token_resp.status_code}")
-
-        if token_resp.status_code != 200:
-            self._log(
-                f"[OAuth Login] token 交换失败: {token_resp.status_code} "
-                f"{token_resp.text[:200]}",
-                "error",
-            )
-            return None
-
-        try:
-            data = token_resp.json()
-        except Exception:
-            self._log("[OAuth Login] token 响应解析失败", "error")
-            return None
-
-        if not data.get("access_token"):
-            self._log("[OAuth Login] token 响应缺少 access_token", "error")
-            return None
-
-        self._log("[OAuth Login] Token 获取成功!")
-        return data
+        token_data = runner.run()
+        if token_data and token_data.get("access_token"):
+            if replace_session and oauth_session is not self.session:
+                self.session = oauth_session
+            self._log("[OAuth Login] Token 获取成功!")
+            return token_data
+        self._log("[OAuth Login] 未获取到 ChatGPT Session Token", "error")
+        return None
 
     def _extract_account_from_id_token(self, id_token: str) -> Dict[str, str]:
         """从 id_token 解析邮箱和 account_id"""
@@ -1632,6 +1649,113 @@ class RegistrationEngine:
             self._log(f"跟随重定向失败: {e}", "error")
             return None
 
+    def _get_cookie_value(self, name: str, domain_hint: Optional[str] = None) -> str:
+        """从当前会话中读取 Cookie。"""
+        jar = getattr(self.session.cookies, "jar", None)
+        if jar is None:
+            try:
+                return self.session.cookies.get(name) or ""
+            except Exception:
+                return ""
+
+        for cookie in list(jar):
+            if getattr(cookie, "name", "") != name:
+                continue
+            if domain_hint and domain_hint not in (getattr(cookie, "domain", "") or ""):
+                continue
+            return (getattr(cookie, "value", "") or "").strip()
+        return ""
+
+    def _decode_jwt_payload(self, token: str) -> Dict[str, Any]:
+        """解析 JWT payload，用于从 access_token 中提取账户信息。"""
+        try:
+            parts = (token or "").split(".")
+            if len(parts) != 3:
+                return {}
+            payload = parts[1]
+            pad = 4 - len(payload) % 4
+            if pad != 4:
+                payload += "=" * pad
+            return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _follow_post_auth_continue_url(self) -> bool:
+        """跟随注册完成后的 continue_url，确保 ChatGPT 会话真正落地。"""
+        self._browser_pause()
+        candidates = []
+        if self._post_auth_continue_url:
+            candidates.append((self._post_auth_continue_url, "https://auth.openai.com/about-you"))
+        if self._otp_continue_url and self._otp_continue_url != self._post_auth_continue_url:
+            candidates.append((self._otp_continue_url, "https://auth.openai.com/email-verification"))
+
+        if not candidates:
+            self._log("[Session Reuse] 无可跟随的 continue_url，直接检查现有会话", "warning")
+            return False
+
+        for target_url, referer in candidates:
+            url = target_url
+            if url.startswith("/"):
+                url = urllib.parse.urljoin("https://auth.openai.com", url)
+            try:
+                response = self.session.get(
+                    url,
+                    headers={
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "upgrade-insecure-requests": "1",
+                        "referer": referer,
+                        "user-agent": self._OAUTH_UA,
+                    },
+                    allow_redirects=True,
+                    timeout=30,
+                )
+                self._log(f"[Session Reuse] continue_url 落地完成: {str(response.url)[:120]}...")
+                return True
+            except Exception as e:
+                self._log(f"[Session Reuse] 跟随 continue_url 失败: {e}", "warning")
+
+        return False
+
+    def _reuse_session_and_get_tokens(self) -> Optional[Dict[str, Any]]:
+        """移植 0330 的后置认证方案：复用注册会话直接读取 ChatGPT Session。"""
+        self._browser_pause()
+        try:
+            flow_state = self._post_auth_flow_state or self._otp_flow_state
+            if not flow_state:
+                fallback_url = str(self._post_auth_continue_url or self._otp_continue_url or "").strip()
+                if fallback_url:
+                    flow_state = extract_flow_state(
+                        current_url=fallback_url,
+                        auth_base="https://auth.openai.com",
+                    )
+
+            reuse_client = SessionReuseClient(
+                self.session,
+                device_id=self._device_id or "",
+                browser_mode=self.browser_mode,
+                user_agent=self._OAUTH_UA,
+                sec_ch_ua='"Not:A-Brand";v="99", "Google Chrome";v="131", "Chromium";v="131"',
+                chrome_full_version="131.0.0.0",
+                accept_language="en-US,en;q=0.9",
+                logger=lambda message: self._log(f"[Session Reuse] {message}"),
+            )
+
+            ok, token_data = reuse_client.reuse_session_and_get_tokens(flow_state)
+            if not ok:
+                self._log(f"[Session Reuse] {token_data}", "warning")
+                return None
+
+            if token_data.get("session_token"):
+                self.session_token = token_data["session_token"]
+            if not token_data.get("workspace_id"):
+                token_data["workspace_id"] = token_data.get("account_id") or ""
+            if not token_data.get("email"):
+                token_data["email"] = self.email or ""
+            return token_data
+        except Exception as e:
+            self._log(f"[Session Reuse] 提取 Token 异常: {e}", "warning")
+            return None
+
     def _handle_oauth_callback(self, callback_url: str) -> Optional[Dict[str, Any]]:
         """处理 OAuth 回调"""
         try:
@@ -1653,6 +1777,137 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
+    def _normalize_direct_oauth_token_data(self, oauth_token_data: Dict[str, Any]) -> Dict[str, Any]:
+        """将直连完整 OAuth 返回值整理为统一 token 结构。"""
+        token_data = dict(oauth_token_data or {})
+        if not token_data.get("session_token"):
+            token_data["session_token"] = self._get_cookie_value("__Secure-next-auth.session-token", "chatgpt.com")
+        if not token_data.get("workspace_id"):
+            token_data["workspace_id"] = token_data.get("account_id") or ""
+        if not token_data.get("email"):
+            token_data["email"] = self.email or ""
+        return token_data
+
+    def _merge_token_data(self, base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+        """将 overlay 中的非空 token 字段合并到 base。"""
+        merged = dict(base or {})
+        for key in (
+            "refresh_token",
+            "id_token",
+            "access_token",
+            "session_token",
+            "account_id",
+            "workspace_id",
+            "email",
+            "user_id",
+            "token_type",
+            "expires_in",
+        ):
+            value = (overlay or {}).get(key)
+            if value:
+                merged[key] = value
+        return merged
+
+    def _run_chatgpt_register_v2(self) -> Optional[Dict[str, Any]]:
+        """移植 0330 的注册状态机，直接完成注册并复用会话提取 Token。"""
+        try:
+            self.password = self._generate_password()
+            user_info = generate_random_user_info()
+            first_name, _, last_name = user_info["name"].partition(" ")
+            last_name = last_name or "Smith"
+            self._profile_first_name = first_name
+            self._profile_last_name = last_name
+            self._profile_birthdate = user_info["birthdate"]
+
+            self._log("3. 使用 0330 注册状态机执行完整注册...")
+            self._log(f"执行密码: {self.password}")
+            self._log(f"注册信息: {user_info['name']}, 生日: {user_info['birthdate']}")
+
+            client = ChatGPTRegisterClientV2(
+                proxy=self.proxy_url,
+                verbose=False,
+                browser_mode=self.browser_mode,
+            )
+            client._log = self._log
+
+            email_adapter = _EmailServiceV2Adapter(
+                email_service=self.email_service,
+                email=self.email or "",
+                email_info=self.email_info,
+                log_fn=self._log,
+                used_codes=self._used_verification_codes,
+            )
+
+            success, message = client.register_complete_flow(
+                self.email or "",
+                self.password,
+                first_name,
+                last_name,
+                user_info["birthdate"],
+                email_adapter,
+            )
+            if not success:
+                self._log(f"V2 注册状态机失败: {message}", "warning")
+                return None
+
+            self.session = client.session
+            self._device_id = client.device_id
+            self._post_auth_flow_state = client.last_registration_state
+            self._is_existing_account = bool(getattr(client, "is_existing_account", False))
+            self.email = self.email or ""
+
+            if not self._is_existing_account:
+                self._log("13. 新注册完成，直接执行完整 OAuth 流程（会重新验证邮箱）...")
+                direct_oauth_token_data = self._perform_oauth_login(
+                    replace_session=False,
+                    preferred_workspace_id="",
+                )
+                if direct_oauth_token_data and (
+                    direct_oauth_token_data.get("refresh_token") or direct_oauth_token_data.get("id_token")
+                ):
+                    token_data = self._normalize_direct_oauth_token_data(direct_oauth_token_data)
+                    self.email = token_data.get("email") or self.email
+                    self.session_token = token_data.get("session_token") or self.session_token
+                    self._log("13.0 完整 OAuth 成功")
+                    self._log(f"13.0 完整 OAuth Token 快照: {_format_token_snapshot(token_data)}")
+                    return token_data
+                self._log("13.0 完整 OAuth 未拿到 refresh_token/id_token，回退到会话复用链路", "warning")
+
+            self._log("13.1 优先复用注册会话获取 Token...")
+            session_ok, token_data = client.reuse_session_and_get_tokens()
+            if not session_ok:
+                self._log(f"V2 会话复用失败: {token_data}", "warning")
+                return None
+
+            self.email = token_data.get("email") or self.email
+            self.session_token = token_data.get("session_token") or self.session_token
+            self._log(f"13.1 会话复用 Token 快照: {_format_token_snapshot(token_data)}")
+
+            if self._is_existing_account:
+                self._log("13.2 执行第二阶段 ChatGPT Web 登录获取 Token...")
+                oauth_token_data = self._perform_oauth_login(
+                    replace_session=False,
+                    preferred_workspace_id=token_data.get("workspace_id") or token_data.get("account_id") or "",
+                )
+                if oauth_token_data and oauth_token_data.get("access_token"):
+                    self._log("13.2 已成功获取第二阶段 ChatGPT Token")
+                    self._log(f"13.2 第二阶段 Token 快照: {_format_token_snapshot(oauth_token_data)}")
+                    token_data = self._merge_token_data(token_data, oauth_token_data)
+                else:
+                    self._log("13.2 第二阶段未获取到额外 Token，保留会话复用结果", "warning")
+                    if oauth_token_data:
+                        self._log(f"13.2 第二阶段返回 Token 快照: {_format_token_snapshot(oauth_token_data)}", "warning")
+
+            if not token_data.get("workspace_id"):
+                token_data["workspace_id"] = token_data.get("account_id") or ""
+            if not token_data.get("email"):
+                token_data["email"] = self.email or ""
+            self._log(f"13.3 最终 Token 快照: {_format_token_snapshot(token_data)}")
+            return token_data
+        except Exception as e:
+            self._log(f"V2 注册状态机异常: {e}", "warning")
+            return None
+
     def run(self) -> RegistrationResult:
         """
         执行完整的注册流程
@@ -1670,6 +1925,9 @@ class RegistrationEngine:
         try:
             self._log("=" * 60)
             self._log("开始注册流程")
+            self._log(f"执行模式: {self.browser_mode}")
+            if self.browser_mode != "protocol":
+                self._log("说明: 当前仍为协议注册链路，执行模式主要影响请求节奏与兼容头")
             self._log("=" * 60)
 
             # 1. 检查 IP 地理位置
@@ -1690,130 +1948,44 @@ class RegistrationEngine:
 
             result.email = self.email
 
-            # 3. 初始化会话
-            self._log("3. 初始化会话...")
-            if not self._init_session():
-                result.error_message = "初始化会话失败"
-                return result
-
-            # 4. 开始 OAuth 流程
-            self._log("4. 开始 OAuth 授权流程...")
-            if not self._start_oauth():
-                result.error_message = "开始 OAuth 流程失败"
-                return result
-
-            # 5. 获取 Device ID
-            self._log("5. 获取 Device ID...")
-            did = self._get_device_id()
-            if not did:
-                result.error_message = "获取 Device ID 失败"
-                return result
-
-            # 6. 检查 Sentinel 拦截
-            self._log("6. 检查 Sentinel 拦截...")
-            sen_token = self._check_sentinel(did)
-            if sen_token:
-                self._log("Sentinel 检查通过")
-            else:
-                self._log("Sentinel 检查失败或未启用", "warning")
-
-            # 7. 提交注册表单 + 解析响应判断账号状态
-            self._log("7. 提交注册表单...")
-            signup_result = self._submit_signup_form(did, sen_token)
-            if not signup_result.success:
-                result.error_message = f"提交注册表单失败: {signup_result.error_message}"
-                return result
-
-            # 8. [已注册账号跳过] 注册密码
-            if self._is_existing_account:
-                self._log("8. [已注册账号] 跳过密码设置，OTP 已自动发送")
-            else:
-                self._log("8. 注册密码...")
-                password_ok, password = self._register_password()
-                if not password_ok:
-                    result.error_message = "注册密码失败"
-                    return result
-
-            # 9. [已注册账号跳过] 发送验证码
-            if self._is_existing_account:
-                self._log("9. [已注册账号] 跳过发送验证码，使用自动发送的 OTP")
-                # 已注册账号的 OTP 在提交表单时已自动发送，记录时间戳
-                self._otp_sent_at = time.time()
-            else:
-                self._log("9. 发送验证码...")
-                if not self._send_verification_code():
-                    result.error_message = "发送验证码失败"
-                    return result
-
-            # 10. 获取验证码
-            self._log("10. 等待验证码...")
-            code = self._get_verification_code()
-            if not code:
-                result.error_message = "获取验证码失败"
-                return result
-
-            # 11. 验证验证码
-            self._log("11. 验证验证码...")
-            if not self._validate_verification_code(code):
-                result.error_message = "验证验证码失败"
-                return result
-
-            # 12. [已注册账号跳过] 创建用户账户
-            if self._is_existing_account:
-                self._log("12. [已注册账号] 跳过创建用户账户")
-                # 已注册账号：跟随 validate_otp 返回的 continue_url 以刷新 cookie
-                otp_continue = getattr(self, "_otp_continue_url", None)
-                if otp_continue:
-                    self._log(f"12.1 跟随 OTP continue_url 刷新 cookie...")
-                    try:
-                        self.session.get(
-                            otp_continue,
-                            headers={
-                                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                                "upgrade-insecure-requests": "1",
-                                "referer": "https://auth.openai.com/email-verification",
-                            },
-                            allow_redirects=True,
-                            timeout=30,
-                        )
-                        self._log("OTP continue_url 跟随完成")
-                    except Exception as e:
-                        self._log(f"跟随 OTP continue_url 失败: {e}", "warning")
-            else:
-                self._log("12. 创建用户账户...")
-                if not self._create_user_account():
-                    result.error_message = "创建用户账户失败"
-                    return result
-
-            # 12.5 执行完整 OAuth 登录流程（获取 Token）
-            # 注册/OTP 流程结束后，需要单独走一次完整的 OAuth 登录才能获取 workspace 和 token
-            self._log("13. 执行 OAuth 登录获取 Token...")
-            token_data = self._perform_oauth_login()
+            auth_method = "session_reuse_v2"
+            token_data = self._run_chatgpt_register_v2()
             if not token_data:
-                result.error_message = "OAuth 登录失败"
+                result.error_message = "V2 注册状态机失败"
                 return result
+            if token_data.get("refresh_token"):
+                auth_method = "session_reuse_v2+oauth_login_v2"
 
             # 从 token 数据提取信息
             result.access_token = token_data.get("access_token", "")
             result.refresh_token = token_data.get("refresh_token", "")
             result.id_token = token_data.get("id_token", "")
+            result.session_token = token_data.get("session_token", "")
+            result.account_id = token_data.get("account_id", "")
+            result.workspace_id = token_data.get("workspace_id", "")
             result.password = self.password or ""
+            if token_data.get("email"):
+                result.email = token_data.get("email", "")
 
             # 从 id_token 解析 account_id
             if result.id_token:
                 account_info = self._extract_account_from_id_token(result.id_token)
-                result.account_id = account_info.get("account_id", "")
+                if not result.account_id:
+                    result.account_id = account_info.get("account_id", "")
                 if account_info.get("email"):
                     result.email = account_info["email"]
+            if not result.workspace_id:
+                result.workspace_id = result.account_id or ""
 
             # 设置来源标记
             result.source = "login" if self._is_existing_account else "register"
 
             # 尝试获取 session_token 从 cookie
-            session_cookie = self.session.cookies.get("__Secure-next-auth.session-token")
-            if session_cookie:
-                self.session_token = session_cookie
+            session_cookie = self._get_cookie_value("__Secure-next-auth.session-token", "chatgpt.com")
+            if session_cookie and not result.session_token:
                 result.session_token = session_cookie
+            if result.session_token:
+                self.session_token = result.session_token
                 self._log(f"获取到 Session Token")
 
             # 17. 完成
@@ -1830,9 +2002,13 @@ class RegistrationEngine:
             result.success = True
             result.metadata = {
                 "email_service": self.email_service.service_type.value,
+                "browser_mode": self.browser_mode,
                 "proxy_used": self.proxy_url,
                 "registered_at": datetime.now().isoformat(),
                 "is_existing_account": self._is_existing_account,
+                "auth_method": auth_method,
+                "auth_provider": token_data.get("auth_provider"),
+                "user_id": token_data.get("user_id", ""),
             }
 
             return result

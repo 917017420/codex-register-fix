@@ -26,13 +26,16 @@ class DuckMailService(BaseEmailService):
     def __init__(self, config: Dict[str, Any] = None, name: str = None):
         super().__init__(EmailServiceType.DUCK_MAIL, name)
 
-        required_keys = ["base_url", "default_domain"]
+        required_keys = ["base_url"]
         missing_keys = [key for key in required_keys if not (config or {}).get(key)]
         if missing_keys:
             raise ValueError(f"缺少必需配置: {missing_keys}")
 
         default_config = {
+            "default_domain": "",
             "api_key": "",
+            "api_style": "auto",
+            "api_key_header": "",
             "password_length": 12,
             "expires_in": None,
             "timeout": 30,
@@ -42,6 +45,13 @@ class DuckMailService(BaseEmailService):
         self.config = {**default_config, **(config or {})}
         self.config["base_url"] = str(self.config["base_url"]).rstrip("/")
         self.config["default_domain"] = str(self.config["default_domain"]).strip().lstrip("@")
+        self.config["api_style"] = str(self.config.get("api_style") or "auto").strip().lower()
+        self.config["api_key_header"] = str(self.config.get("api_key_header") or "").strip()
+        self._api_style = self._resolve_api_style()
+
+        # DuckMail 风格接口需要完整邮箱地址，因此必须有默认域名。
+        if self._api_style == "duckmail" and not self.config["default_domain"]:
+            raise ValueError("duck_mail 缺少 default_domain")
 
         http_config = RequestConfig(
             timeout=self.config["timeout"],
@@ -55,6 +65,21 @@ class DuckMailService(BaseEmailService):
         self._accounts_by_id: Dict[str, Dict[str, Any]] = {}
         self._accounts_by_email: Dict[str, Dict[str, Any]] = {}
 
+    def _resolve_api_style(self) -> str:
+        style = self.config.get("api_style", "auto")
+        if style in {"duckmail", "yyds"}:
+            return style
+
+        header_name = str(self.config.get("api_key_header") or "").lower()
+        if header_name == "x-api-key":
+            return "yyds"
+
+        base_url = self.config["base_url"].lower()
+        if "maliapi.215.im" in base_url or base_url.endswith("/v1") or "/v1/" in base_url:
+            return "yyds"
+
+        return "duckmail"
+
     def _build_headers(
         self,
         token: Optional[str] = None,
@@ -66,17 +91,48 @@ class DuckMailService(BaseEmailService):
             "Content-Type": "application/json",
         }
 
-        auth_token = token
-        if not auth_token and use_api_key and self.config.get("api_key"):
-            auth_token = self.config["api_key"]
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        elif use_api_key and self.config.get("api_key"):
+            api_key = str(self.config["api_key"]).strip()
+            header_name = self.config.get("api_key_header")
+            if not header_name:
+                header_name = "X-API-Key" if self._api_style == "yyds" else "Authorization"
 
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
+            if str(header_name).lower() == "authorization":
+                headers["Authorization"] = f"Bearer {api_key}"
+            else:
+                headers[str(header_name)] = api_key
 
         if extra_headers:
             headers.update(extra_headers)
 
         return headers
+
+    def _unwrap_data(self, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+
+        if "success" in payload:
+            if payload.get("success") is False:
+                error = str(payload.get("error") or payload.get("message") or "API 返回失败")
+                error_code = str(payload.get("errorCode") or "").strip()
+                if error_code:
+                    raise EmailServiceError(f"{error} ({error_code})")
+                raise EmailServiceError(error)
+            if "data" in payload:
+                return payload.get("data")
+
+        return payload
+
+    def _extract_messages(self, payload: Any) -> List[Dict[str, Any]]:
+        data = payload
+        if isinstance(data, dict):
+            if isinstance(data.get("hydra:member"), list):
+                return data.get("hydra:member", [])
+            if isinstance(data.get("messages"), list):
+                return data.get("messages", [])
+        return []
 
     def _make_request(
         self,
@@ -105,9 +161,10 @@ class DuckMailService(BaseEmailService):
                 raise EmailServiceError(error_message)
 
             try:
-                return response.json()
+                payload = response.json()
             except Exception:
                 return {"raw_response": response.text}
+            return self._unwrap_data(payload)
         except Exception as e:
             self.update_status(False, e)
             if isinstance(e, EmailServiceError):
@@ -177,15 +234,34 @@ class DuckMailService(BaseEmailService):
 
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
         request_config = config or {}
-        local_part = str(request_config.get("name") or self._generate_local_part()).strip()
-        domain = str(request_config.get("default_domain") or request_config.get("domain") or self.config["default_domain"]).strip().lstrip("@")
-        address = f"{local_part}@{domain}"
+        raw_address = str(request_config.get("address") or request_config.get("name") or "").strip()
+        local_part = raw_address or self._generate_local_part()
+        domain = str(
+            request_config.get("default_domain")
+            or request_config.get("domain")
+            or self.config.get("default_domain")
+            or ""
+        ).strip().lstrip("@")
+
+        if "@" in local_part:
+            local_part, parsed_domain = local_part.split("@", 1)
+            if not domain:
+                domain = parsed_domain.strip().lstrip("@")
+
+        local_part = local_part.strip() or self._generate_local_part()
+        address = f"{local_part}@{domain}" if domain else local_part
         password = self._generate_password()
 
-        payload: Dict[str, Any] = {
-            "address": address,
-            "password": password,
-        }
+        payload: Dict[str, Any] = {}
+        if self._api_style == "yyds":
+            payload["address"] = local_part
+            if domain:
+                payload["domain"] = domain
+        else:
+            if not domain:
+                raise EmailServiceError("DuckMail 模式需要配置 default_domain 或 domain")
+            payload["address"] = address
+            payload["password"] = password
 
         expires_in = request_config.get("expiresIn", request_config.get("expires_in", self.config.get("expires_in")))
         if expires_in is not None:
@@ -197,18 +273,26 @@ class DuckMailService(BaseEmailService):
             json=payload,
             use_api_key=bool(self.config.get("api_key")),
         )
-        token_response = self._make_request(
-            "POST",
-            "/token",
-            json={
-                "address": account_response.get("address", address),
-                "password": password,
-            },
-        )
 
-        account_id = str(account_response.get("id") or token_response.get("id") or "").strip()
-        resolved_address = str(account_response.get("address") or address).strip()
-        token = str(token_response.get("token") or "").strip()
+        account_id = str(account_response.get("id") or "").strip()
+        resolved_address = str(account_response.get("address") or "").strip()
+        token = str(account_response.get("token") or "").strip()
+
+        if not resolved_address:
+            resolved_address = address
+
+        if not token and resolved_address:
+            token_payload: Dict[str, Any] = {"address": resolved_address}
+            if self._api_style == "duckmail":
+                token_payload["password"] = password
+            token_response = self._make_request(
+                "POST",
+                "/token",
+                json=token_payload,
+            )
+            if not account_id:
+                account_id = str(token_response.get("id") or "").strip()
+            token = str(token_response.get("token") or "").strip()
 
         if not account_id or not resolved_address or not token:
             raise EmailServiceError("DuckMail 返回数据不完整")
@@ -222,6 +306,7 @@ class DuckMailService(BaseEmailService):
             "password": password,
             "created_at": time.time(),
             "raw_account": account_response,
+            "api_style": self._api_style,
         }
 
         self._cache_account(email_info)
@@ -235,6 +320,7 @@ class DuckMailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[set] = None,
     ) -> Optional[str]:
         account_info = self._get_account_info(email=email, email_id=email_id)
         if not account_info:
@@ -248,6 +334,7 @@ class DuckMailService(BaseEmailService):
 
         start_time = time.time()
         seen_message_ids = set()
+        excluded = {str(code).strip() for code in (exclude_codes or set()) if str(code).strip()}
 
         while time.time() - start_time < timeout:
             try:
@@ -257,14 +344,16 @@ class DuckMailService(BaseEmailService):
                     token=token,
                     params={"page": 1},
                 )
-                messages = response.get("hydra:member", [])
+                messages = self._extract_messages(response)
 
                 for message in messages:
                     message_id = str(message.get("id") or "").strip()
                     if not message_id or message_id in seen_message_ids:
                         continue
 
-                    created_at = self._parse_message_time(message.get("createdAt"))
+                    created_at = self._parse_message_time(
+                        str(message.get("createdAt") or message.get("created_at") or "")
+                    )
                     if otp_sent_at and created_at and created_at + 1 < otp_sent_at:
                         continue
 
@@ -281,8 +370,11 @@ class DuckMailService(BaseEmailService):
 
                     match = re.search(pattern, content)
                     if match:
+                        code = match.group(1)
+                        if code in excluded:
+                            continue
                         self.update_status(True)
-                        return match.group(1)
+                        return code
             except Exception as e:
                 logger.debug(f"DuckMail 轮询验证码失败: {e}")
 
@@ -320,12 +412,13 @@ class DuckMailService(BaseEmailService):
 
     def check_health(self) -> bool:
         try:
-            self._make_request(
-                "GET",
-                "/domains",
-                params={"page": 1},
-                use_api_key=bool(self.config.get("api_key")),
-            )
+            request_kwargs: Dict[str, Any] = {
+                "use_api_key": bool(self.config.get("api_key")),
+            }
+            if self._api_style == "duckmail":
+                request_kwargs["params"] = {"page": 1}
+
+            self._make_request("GET", "/domains", **request_kwargs)
             self.update_status(True)
             return True
         except Exception as e:
@@ -343,7 +436,7 @@ class DuckMailService(BaseEmailService):
             token=account_info["token"],
             params={"page": kwargs.get("page", 1)},
         )
-        return response.get("hydra:member", [])
+        return self._extract_messages(response)
 
     def get_message_detail(self, email_id: str, message_id: str) -> Optional[Dict[str, Any]]:
         account_info = self._get_account_info(email_id=email_id) or self._get_account_info(email=email_id)
@@ -361,6 +454,7 @@ class DuckMailService(BaseEmailService):
             "name": self.name,
             "base_url": self.config["base_url"],
             "default_domain": self.config["default_domain"],
+            "api_style": self._api_style,
             "cached_accounts": len(self._accounts_by_email),
             "status": self.status.value,
         }

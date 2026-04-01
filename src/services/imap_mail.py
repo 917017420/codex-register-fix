@@ -121,10 +121,12 @@ class ImapMailService(BaseEmailService):
         timeout: int = 60,
         pattern: str = None,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[set] = None,
     ) -> Optional[str]:
         """轮询 IMAP 收件箱，获取 OpenAI 验证码"""
         start_time = time.time()
         seen_ids: set = set()
+        excluded = {str(code).strip() for code in (exclude_codes or set()) if str(code).strip()}
         mail = None
 
         try:
@@ -163,6 +165,8 @@ class ImapMailService(BaseEmailService):
                         body = self._get_text_body(msg)
                         code = self._extract_otp(body)
                         if code:
+                            if code in excluded:
+                                continue
                             # 标记已读
                             mail.store(msg_id, "+FLAGS", "\\Seen")
                             self.update_status(True)

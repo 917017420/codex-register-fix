@@ -119,6 +119,8 @@ def test_generate_token_json_includes_account_proxy_url_when_enabled():
         id_token="id-token",
         account_id="acct-1",
         access_token="access-token",
+        session_token="session-token",
+        client_id="client-123",
         last_refresh=None,
         refresh_token="refresh-token",
         proxy_used="socks5://127.0.0.1:1080",
@@ -126,6 +128,8 @@ def test_generate_token_json_includes_account_proxy_url_when_enabled():
 
     token_data = cpa_upload.generate_token_json(account, include_proxy_url=True)
 
+    assert token_data["session_token"] == "session-token"
+    assert token_data["client_id"] == "client-123"
     assert token_data["proxy_url"] == "socks5://127.0.0.1:1080"
 
 
@@ -136,6 +140,8 @@ def test_generate_token_json_uses_fallback_proxy_when_account_proxy_missing():
         id_token="id-token",
         account_id="acct-1",
         access_token="access-token",
+        session_token="",
+        client_id="client-456",
         last_refresh=None,
         refresh_token="refresh-token",
         proxy_used=None,
@@ -147,4 +153,5 @@ def test_generate_token_json_uses_fallback_proxy_when_account_proxy_missing():
         proxy_url="http://proxy.example.com:8080",
     )
 
+    assert token_data["client_id"] == "client-456"
     assert token_data["proxy_url"] == "http://proxy.example.com:8080"
